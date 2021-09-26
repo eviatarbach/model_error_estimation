@@ -30,20 +30,4 @@ function rk4(f::Function, y0::Array{Float64, 1}, t0::Float64,
     end
 end
 
-function rk4_prop(jac::Function, y0::Array{Float64, 1}, t0::Float64,
-                  t1::Float64, h::Float64)
-    y = y0
-    n = round(Int, (t1 - t0)/h)
-    t = t0
-    A_acc = I
-    for i in 1:n
-        J = jac(t, y)
-        A = I + h*J + h^2/factorial(2)*J^2 + h^3/factorial(3)*J^3 + h^4/factorial(4)*J^4
-        A_acc = A*A_acc
-        y = A*y
-        t = t0 + i*h
-    end
-    return A_acc
-end
-
 end
