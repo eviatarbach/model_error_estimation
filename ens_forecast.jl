@@ -65,10 +65,9 @@ function da_cycles(; x0::AbstractVector{float_type},
 
         x_m = mean(E, dims=2)
         innovation = y - H*x_m
-        P_e = innovation*innovation'
-        P_f = Symmetric(cov(E'))
+        P_p = Symmetric(cov(E'))
 
-        C = P_e - R - H*P_f*H'
+        C = innovation*innovation' - R - H*P_p*H'
         if rank(H) >= model_size
             Q_est = pinv(H)*C*pinv(H)'
         else
