@@ -1,6 +1,6 @@
 module ens_forecast
 
-export model_err, init_ens, mmda
+export da_cycles
 
 using Statistics
 using LinearAlgebra
@@ -18,296 +18,107 @@ struct Forecast_Info
     spread
     spread_fcst
     Q_hist
-    Q_true_hist
-    bias_hist
-    analyses
-    model_errs
-    inflation_hist
+    model_err
 end
 
 xskillscore = pyimport("xskillscore")
 xarray = pyimport("xarray")
 
-function model_err(; model_true::Function, model_err::Function,
-                     integrator::Function, x0::AbstractVector{float_type},
-                     t0::float_type, outfreq::Integer, Δt::float_type,
-                     window::Integer, n_samples::Integer) where {float_type<:AbstractFloat}
-    D = length(x0)
-
-    errs = Array{float_type}(undef, n_samples, D)
-
-    t = t0
-    x = x0
-    for i=1:n_samples
-        x_true = integrator(model_true, x, t, t + window*outfreq*Δt, Δt)
-        x_err = integrator(model_err, x, t, t + window*outfreq*Δt, Δt)
-        errs[i, :] = x_err - x_true
-        t += window*outfreq*Δt
-        x = x_true
-    end
-    return errs'*errs/(n_samples - 1), mean(errs, dims=1)
-end
-
-function init_ens(; model::Function, integrator::Function,
-                    x0::AbstractVector{float_type}, t0::float_type,
-                    outfreq::int_type, Δt::float_type,
-                    ens_size::int_type) where {float_type<:AbstractFloat,
-                                               int_type<:Integer}
-    E = copy(integrator(model, x0, t0, ens_size*Δt*outfreq, Δt,
-                        inplace=false)[1:outfreq:end, :]')
-    return E
-end
-
-function make_psd(A)
+function make_psd(A, tol=1e-6)
     L, Q = eigen(A)
-    L[L .< 0] .= 1e-6
+    L[L .< 0] .= tol
     return Symmetric(Q*diagm(0=>L)*inv(Q))
 end
 
-function mmda(; x0::AbstractVector{float_type},
-                ensembles::AbstractVector{<:AbstractMatrix{float_type}},
-                models::AbstractVector{<:Function}, model_true::Function,
-                obs_ops::AbstractVector{<:AbstractMatrix}, H_true=I,
-                mappings,
-                model_errs::AbstractVector{<:Union{AbstractMatrix{float_type}, Nothing}},
-                model_errs_prescribed,
-                biases::AbstractVector{<:Union{AbstractVector{float_type}, Nothing}},
-                integrator::Function, da_method::Function, localization,
-                ens_sizes::AbstractVector{int_type},
-                Δt::float_type, window::int_type, n_cycles::int_type,
-                outfreq::int_type, model_sizes::AbstractVector{int_type},
-                R::Symmetric{float_type}, ens_errs=false, ρ::float_type, Q_p=nothing,
-                ρ_all=0.01, all_orders::Bool=true,
-                combine_forecasts::Bool=true, gen_ensembles=false, assimilate_obs=true, save_Q_hist=false,
-                save_analyses::Bool=false, prev_analyses=nothing, leads=1,
-                ref_model=1) where {float_type<:AbstractFloat, int_type<:Integer}
-    n_models = length(models)
+function da_cycles(; x0::AbstractVector{float_type},
+                     E::AbstractMatrix{float_type}, model::Function,
+                     model_true::Function, H::AbstractMatrix,
+                     model_err::AbstractMatrix{float_type},
+                     model_err_prescribed::Union{AbstractMatrix{float_type}, Nothing}=nothing,
+                     integrator::Function, da_method::Function, Δt::float_type,
+                     window::int_type, n_cycles::int_type, outfreq::int_type,
+                     model_size::int_type, R::Symmetric{float_type},
+                     ρ::float_type, Q_p::Union{AbstractVector{<:AbstractMatrix{float_type}}, Nothing}=nothing,
+                     save_Q_hist::Bool=false) where {float_type<:AbstractFloat, int_type<:Integer}
     obs_err_dist = MvNormal(R)
     R_inv = inv(R)
 
+    ens_size = size(E, 2)
+
     x_true = x0
 
-    errs = Array{float_type}(undef, n_cycles, model_sizes[ref_model])
-    errs_fcst = Array{float_type}(undef, n_cycles, model_sizes[ref_model])
+    errs = Array{float_type}(undef, n_cycles, model_size)
+    errs_fcst = Array{float_type}(undef, n_cycles, model_size)
     crps = Array{float_type}(undef, n_cycles)
     crps_fcst = Array{float_type}(undef, n_cycles)
-    Q_hist = Array{float_type}(undef, n_models, n_cycles)
-    Q_true_hist = Array{float_type}(undef, n_models, n_cycles)
+    Q_hist = Array{float_type}(undef, n_cycles)
     if save_Q_hist
-        Q_hist = Array{Matrix{float_type}}(undef, n_models, n_cycles)
-        Q_true_hist = Array{Matrix{float_type}}(undef, n_models, n_cycles)
+        Q_hist = Array{Matrix{float_type}}(undef, n_cycles)
     end
-    bias_hist = Array{Vector{float_type}}(undef, n_models, n_cycles)
     spread = Array{float_type}(undef, n_cycles)
     spread_fcst = Array{float_type}(undef, n_cycles)
-    inflation_hist = Array{float_type}(undef, n_cycles)
-
-    inflation_all = ones(leads)
-
-    if save_analyses
-        analyses = Array{float_type}(undef, n_cycles, model_sizes[ref_model], sum(ens_sizes))
-    else
-        analyses = nothing
-    end
-
-    model_errs_leads = Array{AbstractMatrix{float_type}}(undef, n_models, leads)
-
-    for model=1:n_models
-        for lead=1:leads
-            model_errs_leads[model, lead] = model_errs[model]*lead^2
-        end
-    end
-
-    if all_orders
-        orders = []
-        for i=1:n_models
-            order = Array(1:n_models)
-            replace!(order, 1=>i, i=>1)
-            append!(orders, [order])
-        end
-    else
-        order = Array(1:n_models)
-        replace!(order, 1=>ref_model, ref_model=>1)
-        orders = [order]
-    end
 
     t = 0.0
 
     @showprogress for cycle=1:n_cycles
-        y = H_true*x_true + rand(obs_err_dist)
+        y = H*x_true + rand(obs_err_dist)
 
-        lead = mod(cycle, leads)
+        x_m = mean(E, dims=2)
+        innovation = y - H*x_m
+        P_e = innovation*innovation'
+        P_f = Symmetric(cov(E'))
 
-        for model=1:n_models
-            model_size = model_sizes[model]
-            E = ensembles[model]
-
-            H_m = obs_ops[model]
-
-            x_m = mean(E, dims=2)
-            #m = ens_sizes[model]
-            #P_true = (E .- x_true)*(E .- x_true)'/(m - 1)#(x_true - x_m)*(x_true - x_m)'
-            innovation = y - H_m*x_m
-            P_e = innovation*innovation'
-            #b = ρ*innovation[:] + (1 - ρ)*biases[model]
-            #E .+= b
-            #P_e = (H_model_prime*E .- y)*(H_model_prime*E .- y)'/(m - 1)
-            P_f = Symmetric(cov(E'))
-
-            C = P_e - R - H_m*P_f*H_m'
-            if rank(H_m) >= model_size
-                Q_est = pinv(H_m)*C*pinv(H_m)'
-            else
-                A = Array{float_type}(undef, size(R)[1]^2, length(Q_p))
-                for p=1:length(Q_p)
-                    A[:, p] = vec(H_m*Q_p[p]*H_m')
-                end
-                q = A \ vec(C)
-                Q_est = sum([q[p]*Q_p[p] for p=1:length(Q_p)])
-            end
-            #Q_true = P_true - P_f
-            #Q_est = diagm(0=>diag(Q_est))
-
-            Q = Symmetric(ρ*Q_est + (1 - ρ)*model_errs_leads[model, lead + 1])
-
-            if !isposdef(Q)
-                Q = make_psd(Q)
-            end
-
-            if save_Q_hist
-                Q_hist[model, cycle] = Q
-                #Q_true_hist[model, cycle] = Q_true
-            else
-                Q_hist[model, cycle] = tr(Q)
-                #Q_true_hist[model, cycle] = tr(Q_true)
-            end
-            model_errs_leads[model, lead + 1] = Q
-            #bias_hist[model, cycle] = b
-            #biases[model] = b
-
-            E += rand(MvNormal(model_errs_leads[model, lead + 1]), ens_sizes[model])
-
-            ensembles[model] = E
-        end
-
-        ensembles_new = similar(ensembles)
-        # Iterative multi-model data assimilation
-        if combine_forecasts
-            for (i, order) in enumerate(orders)
-                for model=2:n_models
-                    # Posterior ensemble of the previous model is used as the prior
-                    # ensemble for the next model
-                    if model == 2
-                        E = ensembles[order[model-1]]
-                    else
-                        E = ensembles_new[i]
-                    end
-
-                    E_model = ensembles[order[model]]
-
-                    H_model = mappings[order[1], order[model]]
-
-                    P_f = cov(E_model')
-                    # P_f_diag = Tridiagonal(diagm(0=>diag(P_f)))
-                    if localization !== nothing
-                        P_f = (mappings[ref_model, order[model]]*localization*mappings[ref_model, order[model]]').*P_f
-                    else
-                        P_f = Diagonal(diagm(diag(P_f)))
-                    end
-                    P_f_inv = Symmetric(inv(P_f))
-
-                    # Assimilate the forecast of each ensemble member of the current
-                    # model as if it were an observation
-                    E = da_method(E=E, R=Symmetric(Matrix(P_f)), R_inv=P_f_inv, H=H_model, y=mean(E_model, dims=2)[:, 1],
-                                  ρ=mappings[ref_model, order[model-1]]*localization*mappings[ref_model, order[model-1]]')
-
-                    ensembles_new[i] = E
-                end
-            end
-        end
-
-        if (n_models > 1) & (combine_forecasts)
-            ensembles = ensembles_new
-        end
-
-        if all_orders & (~all(model_sizes[1] .== model_sizes))
-            error("Not implemented")
-        end
-
-        if (~all_orders) & (~all(ens_sizes[1] .== ens_sizes))
-            error("Ensemble sizes must be the same")
-        end
-
-        if all_orders
-            E_all = hcat([mappings[model, ref_model]*ensembles[model] for model=1:n_models]...)
+        C = P_e - R - H*P_f*H'
+        if rank(H) >= model_size
+            Q_est = pinv(H)*C*pinv(H)'
         else
-            E_all = ensembles[1]
-        end
-
-	    if (combine_forecasts & (n_models > 1))
-            H = obs_ops[ref_model]
-
-            x_m = mean(E_all, dims=2)
-            innovation = y - H*x_m
-
-            P_e = innovation*innovation'
-            P_f = Symmetric(cov(E_all'))
-            λ = tr(P_e - R)/tr(H*P_f*H')
-
-            inflation_all[lead + 1] = ρ_all*λ + (1 - ρ_all)*inflation_all[lead + 1]
-	        inflation_hist[cycle] = inflation_all[lead + 1]
-
-            E_all = x_m .+ sqrt(inflation_all[lead + 1])*(E_all .- x_m)
-        end
-
-        errs_fcst[cycle, :] = mean(E_all, dims=2) - pinv(obs_ops[ref_model])*H_true*x_true
-
-	    E_corr_fcst_array = xarray.DataArray(data=E_all, dims=["dim", "member"])
-        crps_fcst[cycle] = xskillscore.crps_ensemble(pinv(obs_ops[ref_model])*H_true*x_true, E_corr_fcst_array).values[1]
-        spread_fcst[cycle] = mean(std(E_all, dims=2))
-
-        if assimilate_obs
-            E_a = da_method(E=E_all, R=R, R_inv=R_inv, H=obs_ops[ref_model],
-                            y=y, ρ=localization)
-
-            E_corr_array = xarray.DataArray(data=E_a, dims=["dim", "member"])
-            crps[cycle] = xskillscore.crps_ensemble(pinv(obs_ops[ref_model])*H_true*x_true, E_corr_array).values[1]
-
-            spread[cycle] = mean(std(E_a, dims=2))
-
-            if save_analyses
-                analyses[cycle, :, :] = E_a
+            A = Array{float_type}(undef, size(R)[1]^2, length(Q_p))
+            for p=1:length(Q_p)
+                A[:, p] = vec(H*Q_p[p]*H')
             end
-            errs[cycle, :] = mean(E_a, dims=2) - pinv(obs_ops[ref_model])*H_true*x_true
+            q = A \ vec(C)
+            Q_est = sum([q[p]*Q_p[p] for p=1:length(Q_p)])
+        end
+
+        Q = Symmetric(ρ*Q_est + (1 - ρ)*model_err)
+
+        if !isposdef(Q)
+            Q = make_psd(Q)
+        end
+
+        if save_Q_hist
+            Q_hist[cycle] = Q
         else
-            E_a = E_all
+            Q_hist[cycle] = tr(Q)
         end
+        model_err = Q
 
-        for model=1:n_models
-            if gen_ensembles & (mod(cycle, leads) == 0) # ??
-                E = mappings[ref_model, model]*pinv(obs_ops[ref_model])*H_true*x_true .+ rand(MvNormal(ens_errs[model]), ens_sizes[model])
-            elseif prev_analyses !== nothing
-                E = prev_analyses[cycle, :, [0; cumsum(ens_sizes)][model]+1:[0; cumsum(ens_sizes)][model+1]]
-            else
-                if all_orders
-                    E = mappings[ref_model, model]*E_a[:, [0; cumsum(ens_sizes)][model]+1:[0; cumsum(ens_sizes)][model+1]]
-                else
-                    E = mappings[ref_model, model]*E_a
-                end
-            end
+        E += rand(MvNormal(model_err), ens_size)
 
-            if model_errs_prescribed[model] === nothing
-                pert = zeros(model_sizes[model])
-            else
-                pert = rand(MvNormal(model_errs_prescribed[model]))
-            end
-            Threads.@threads for i=1:ens_sizes[model]
-                integration = integrator(models[model], E[:, i], t,
-                                         t + window*outfreq*Δt, Δt, inplace=false)
-                E[:, i] = integration[end, :] + pert
-            end
+        errs_fcst[cycle, :] = mean(E, dims=2) - x_true
 
-            ensembles[model] = E
+	    E_corr_fcst_array = xarray.DataArray(data=E, dims=["dim", "member"])
+        crps_fcst[cycle] = xskillscore.crps_ensemble(x_true, E_corr_fcst_array).values[1]
+        spread_fcst[cycle] = mean(std(E, dims=2))
+
+        E = da_method(E=E, R=R, R_inv=R_inv, H=H, y=y)
+
+        E_corr_array = xarray.DataArray(data=E, dims=["dim", "member"])
+        crps[cycle] = xskillscore.crps_ensemble(x_true, E_corr_array).values[1]
+
+        spread[cycle] = mean(std(E, dims=2))
+
+        errs[cycle, :] = mean(E, dims=2) - x_true
+
+        if model_err_prescribed === nothing
+            pert = zeros(model_size)
+        else
+            pert = rand(MvNormal(model_err_prescribed))
+        end
+        for i=1:ens_size
+            integration = integrator(model, E[:, i], t,
+                                     t + window*outfreq*Δt, Δt, inplace=false)
+            E[:, i] = integration[end, :] + pert
         end
 
         x_true = integrator(model_true, x_true, t, t + window*outfreq*Δt, Δt)
@@ -316,8 +127,7 @@ function mmda(; x0::AbstractVector{float_type},
     end
 
     return Forecast_Info(errs, errs_fcst, crps, crps_fcst, spread, spread_fcst,
-                         Q_hist, Q_true_hist, bias_hist, analyses,
-                         model_errs_leads, inflation_hist), ensembles, x_true
+                         Q_hist, model_err)
 end
 
 end
